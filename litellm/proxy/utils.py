@@ -26,6 +26,13 @@ from typing import (
     overload,
 )
 
+from litellm.litellm_core_utils.duration_parser import (
+    _extract_from_regex,
+    duration_in_seconds,
+    get_last_day_of_month,
+)
+from litellm.proxy._types import ProxyErrorTypes, ProxyException
+
 try:
     import backoff
 except ImportError:
@@ -335,14 +342,14 @@ class ProxyLogging:
                 alert_to_webhook_url=self.alert_to_webhook_url,
             )
 
-            if (
-                self.alerting is not None
-                and "slack" in self.alerting
-                and "daily_reports" in self.alert_types
-            ):
+            if self.alerting is not None and "slack" in self.alerting:
                 # NOTE: ENSURE we only add callbacks when alerting is on
                 # We should NOT add callbacks when alerting is off
-                litellm.callbacks.append(self.slack_alerting_instance)  # type: ignore
+                if "daily_reports" in self.alert_types:
+                    litellm.callbacks.append(self.slack_alerting_instance)  # type: ignore
+                litellm.success_callback.append(
+                    self.slack_alerting_instance.response_taking_too_long_callback
+                )
 
         if redis_cache is not None:
             self.internal_usage_cache.dual_cache.redis_cache = redis_cache
@@ -352,9 +359,6 @@ class ProxyLogging:
         litellm.callbacks.append(self.max_budget_limiter)  # type: ignore
         litellm.callbacks.append(self.cache_control_check)  # type: ignore
         litellm.callbacks.append(self.service_logging_obj)  # type: ignore
-        litellm.success_callback.append(
-            self.slack_alerting_instance.response_taking_too_long_callback
-        )
         for callback in litellm.callbacks:
             if isinstance(callback, str):
                 callback = litellm.litellm_core_utils.litellm_logging._init_custom_logger_compatible_class(  # type: ignore
@@ -850,6 +854,20 @@ class ProxyLogging:
                     ),
                 ).start()
 
+        await self._run_post_call_failure_hook_custom_loggers(
+            original_exception=original_exception,
+            request_data=request_data,
+            user_api_key_dict=user_api_key_dict,
+        )
+
+        return
+
+    async def _run_post_call_failure_hook_custom_loggers(
+        self,
+        original_exception: Exception,
+        request_data: dict,
+        user_api_key_dict: UserAPIKeyAuth,
+    ):
         for callback in litellm.callbacks:
             try:
                 _callback: Optional[CustomLogger] = None
@@ -868,7 +886,38 @@ class ProxyLogging:
             except Exception as e:
                 raise e
 
-        return
+    async def async_log_proxy_authentication_errors(
+        self,
+        original_exception: Exception,
+        request: Request,
+        parent_otel_span: Optional[Any],
+        api_key: Optional[str],
+    ):
+        """
+        Handler for Logging Authentication Errors on LiteLLM Proxy
+        Why not use post_call_failure_hook?
+        - `post_call_failure_hook` calls `litellm_logging_obj.async_failure_handler`. This led to the Exception being logged twice
+
+        What does this handler do?
+        - Logs Authentication Errors (like invalid API Key passed) to CustomLogger compatible classes (OTEL, Datadog etc)
+            - calls CustomLogger.async_post_call_failure_hook
+        """
+
+        user_api_key_dict = UserAPIKeyAuth(
+            parent_otel_span=parent_otel_span,
+            token=_hash_token_if_needed(token=api_key or ""),
+        )
+        try:
+            request_data = await request.json()
+        except json.JSONDecodeError:
+            # For GET requests or requests without a JSON body
+            request_data = {}
+        await self._run_post_call_failure_hook_custom_loggers(
+            original_exception=original_exception,
+            request_data=request_data,
+            user_api_key_dict=user_api_key_dict,
+        )
+        pass
 
     async def post_call_success_hook(
         self,
@@ -2430,86 +2479,6 @@ def _hash_token_if_needed(token: str) -> str:
         return token
 
 
-def _extract_from_regex(duration: str) -> Tuple[int, str]:
-    match = re.match(r"(\d+)(mo|[smhd]?)", duration)
-
-    if not match:
-        raise ValueError("Invalid duration format")
-
-    value, unit = match.groups()
-    value = int(value)
-
-    return value, unit
-
-
-def get_last_day_of_month(year, month):
-    # Handle December case
-    if month == 12:
-        return 31
-    # Next month is January, so subtract a day from March 1st
-    next_month = datetime(year=year, month=month + 1, day=1)
-    last_day_of_month = (next_month - timedelta(days=1)).day
-    return last_day_of_month
-
-
-def _duration_in_seconds(duration: str) -> int:
-    """
-    Parameters:
-    - duration:
-        - "<number>s" - seconds
-        - "<number>m" - minutes
-        - "<number>h" - hours
-        - "<number>d" - days
-        - "<number>mo" - months
-
-    Returns time in seconds till when budget needs to be reset
-    """
-    value, unit = _extract_from_regex(duration=duration)
-
-    if unit == "s":
-        return value
-    elif unit == "m":
-        return value * 60
-    elif unit == "h":
-        return value * 3600
-    elif unit == "d":
-        return value * 86400
-    elif unit == "mo":
-        now = time.time()
-        current_time = datetime.fromtimestamp(now)
-
-        if current_time.month == 12:
-            target_year = current_time.year + 1
-            target_month = 1
-        else:
-            target_year = current_time.year
-            target_month = current_time.month + value
-
-        # Determine the day to set for next month
-        target_day = current_time.day
-        last_day_of_target_month = get_last_day_of_month(target_year, target_month)
-
-        if target_day > last_day_of_target_month:
-            target_day = last_day_of_target_month
-
-        next_month = datetime(
-            year=target_year,
-            month=target_month,
-            day=target_day,
-            hour=current_time.hour,
-            minute=current_time.minute,
-            second=current_time.second,
-            microsecond=current_time.microsecond,
-        )
-
-        # Calculate the duration until the first day of the next month
-        duration_until_next_month = next_month - current_time
-        return int(duration_until_next_month.total_seconds())
-
-    else:
-        raise ValueError("Unsupported duration unit")
-
-
 async def reset_budget(prisma_client: PrismaClient):
     """
     Gets all the non-expired keys for a db, which need spend to be reset
@@ -2528,7 +2497,7 @@ async def reset_budget(prisma_client: PrismaClient):
         if keys_to_reset is not None and len(keys_to_reset) > 0:
             for key in keys_to_reset:
                 key.spend = 0.0
-                duration_s = _duration_in_seconds(duration=key.budget_duration)
+                duration_s = duration_in_seconds(duration=key.budget_duration)
                 key.budget_reset_at = now + timedelta(seconds=duration_s)
 
             await prisma_client.update_data(
@@ -2544,7 +2513,7 @@ async def reset_budget(prisma_client: PrismaClient):
         if users_to_reset is not None and len(users_to_reset) > 0:
             for user in users_to_reset:
                 user.spend = 0.0
-                duration_s = _duration_in_seconds(duration=user.budget_duration)
+                duration_s = duration_in_seconds(duration=user.budget_duration)
                 user.budget_reset_at = now + timedelta(seconds=duration_s)
 
             await prisma_client.update_data(
@@ -2562,7 +2531,7 @@ async def reset_budget(prisma_client: PrismaClient):
         if teams_to_reset is not None and len(teams_to_reset) > 0:
             team_reset_requests = []
             for team in teams_to_reset:
-                duration_s = _duration_in_seconds(duration=team.budget_duration)
+                duration_s = duration_in_seconds(duration=team.budget_duration)
                 reset_team_budget_request = ResetTeamBudgetRequest(
                     team_id=team.team_id,
                     spend=0.0,
@@ -3095,3 +3064,55 @@ def get_error_message_str(e: Exception) -> str:
     else:
         error_message = str(e)
     return error_message
+
+
+def _get_redoc_url() -> str:
+    """
+    Get the redoc URL from the environment variables.
+
+    - If REDOC_URL is set, return it.
+    - Otherwise, default to "/redoc".
+    """
+    return os.getenv("REDOC_URL", "/redoc")
+
+
+def _get_docs_url() -> Optional[str]:
+    """
+    Get the docs URL from the environment variables.
+
+    - If DOCS_URL is set, return it.
+    - If NO_DOCS is True, return None.
+    - Otherwise, default to "/".
+    """
+    docs_url = os.getenv("DOCS_URL", None)
+    if docs_url:
+        return docs_url
+
+    if os.getenv("NO_DOCS", "False") == "True":
+        return None
+
+    # default to "/"
+    return "/"
+
+
+def handle_exception_on_proxy(e: Exception) -> ProxyException:
+    """
+    Returns an Exception as ProxyException, this ensures all exceptions are OpenAI API compatible
+    """
+    from fastapi import status
+
+    if isinstance(e, HTTPException):
+        return ProxyException(
+            message=getattr(e, "detail", f"error({str(e)})"),
+            type=ProxyErrorTypes.internal_server_error,
+            param=getattr(e, "param", "None"),
+            code=getattr(e, "status_code", status.HTTP_500_INTERNAL_SERVER_ERROR),
+        )
+    elif isinstance(e, ProxyException):
+        return e
+    return ProxyException(
+        message="Internal Server Error, " + str(e),
+        type=ProxyErrorTypes.internal_server_error,
+        param=getattr(e, "param", "None"),
+        code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+    )

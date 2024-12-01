@@ -42,11 +42,14 @@ class BaseLLMChatTest(ABC):
                 "content": [{"type": "text", "text": "Hello, how are you?"}],
             }
         ]
-        response = litellm.completion(
-            **base_completion_call_args,
-            messages=messages,
-        )
-        assert response is not None
+        try:
+            response = litellm.completion(
+                **base_completion_call_args,
+                messages=messages,
+            )
+            assert response is not None
+        except litellm.InternalServerError:
+            pytest.skip("Model is overloaded")
 
         # for OpenAI the content contains the JSON schema, so we need to assert that the content is not None
         assert response.choices[0].message.content is not None
@@ -59,7 +62,14 @@ class BaseLLMChatTest(ABC):
         response = litellm.completion(**base_completion_call_args, messages=messages)
         assert response is not None
 
-    def test_json_response_format(self):
+    @pytest.mark.parametrize(
+        "response_format",
+        [
+            {"type": "json_object"},
+            {"type": "text"},
+        ],
+    )
+    def test_json_response_format(self, response_format):
         """
         Test that the JSON response format is supported by the LLM API
         """
@@ -80,7 +90,7 @@ class BaseLLMChatTest(ABC):
         response = litellm.completion(
             **base_completion_call_args,
             messages=messages,
-            response_format={"type": "json_object"},
+            response_format=response_format,
         )
 
         print(response)
@@ -88,6 +98,43 @@ class BaseLLMChatTest(ABC):
         # OpenAI guarantees that the JSON schema is returned in the content
         # relevant issue: https://github.com/BerriAI/litellm/issues/6741
         assert response.choices[0].message.content is not None
+
+    @pytest.mark.flaky(retries=6, delay=1)
+    def test_json_response_pydantic_obj(self):
+        litellm.set_verbose = True
+        from pydantic import BaseModel
+        from litellm.utils import supports_response_schema
+
+        os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+        litellm.model_cost = litellm.get_model_cost_map(url="")
+
+        class TestModel(BaseModel):
+            first_response: str
+
+        base_completion_call_args = self.get_base_completion_call_args()
+        if not supports_response_schema(base_completion_call_args["model"], None):
+            pytest.skip("Model does not support response schema")
+
+        try:
+            res = litellm.completion(
+                **base_completion_call_args,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {
+                        "role": "user",
+                        "content": "What is the capital of France?",
+                    },
+                ],
+                response_format=TestModel,
+            )
+            assert res is not None
+
+            print(res.choices[0].message)
+
+            assert res.choices[0].message.content is not None
+            assert res.choices[0].message.tool_calls is None
+        except litellm.InternalServerError:
+            pytest.skip("Model is overloaded")
 
     def test_json_response_format_stream(self):
         """
@@ -107,12 +154,15 @@ class BaseLLMChatTest(ABC):
             },
         ]
 
-        response = litellm.completion(
-            **base_completion_call_args,
-            messages=messages,
-            response_format={"type": "json_object"},
-            stream=True,
-        )
+        try:
+            response = litellm.completion(
+                **base_completion_call_args,
+                messages=messages,
+                response_format={"type": "json_object"},
+                stream=True,
+            )
+        except litellm.InternalServerError:
+            pytest.skip("Model is overloaded")
 
         print(response)
 
@@ -127,6 +177,54 @@ class BaseLLMChatTest(ABC):
         # we need to assert that the JSON schema was returned in the content, (for Anthropic we were returning it as part of the tool call)
         assert content is not None
         assert len(content) > 0
+
+    @pytest.fixture
+    def tool_call_no_arguments(self):
+        return {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_2c384bc6-de46-4f29-8adc-60dd5805d305",
+                    "function": {"name": "Get-FAQ", "arguments": "{}"},
+                    "type": "function",
+                }
+            ],
+        }
+
+    @abstractmethod
+    def test_tool_call_no_arguments(self, tool_call_no_arguments):
+        """Test that tool calls with no arguments is translated correctly. Relevant issue: https://github.com/BerriAI/litellm/issues/6833"""
+        pass
+
+    def test_image_url(self):
+        litellm.set_verbose = True
+        from litellm.utils import supports_vision
+
+        os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+        litellm.model_cost = litellm.get_model_cost_map(url="")
+
+        base_completion_call_args = self.get_base_completion_call_args()
+        if not supports_vision(base_completion_call_args["model"], None):
+            pytest.skip("Model does not support image input")
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What's in this image?"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "https://i.pinimg.com/736x/b4/b1/be/b4b1becad04d03a9071db2817fc9fe77.jpg"
+                        },
+                    },
+                ],
+            }
+        ]
+
+        response = litellm.completion(**base_completion_call_args, messages=messages)
+        assert response is not None
 
     @pytest.fixture
     def pdf_messages(self):

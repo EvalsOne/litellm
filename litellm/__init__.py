@@ -24,6 +24,7 @@ from litellm.proxy._types import (
     KeyManagementSettings,
     LiteLLM_UpperboundKeyGenerateParams,
 )
+from litellm.types.utils import StandardKeyGenerationConfig
 import httpx
 import dotenv
 from enum import Enum
@@ -67,6 +68,7 @@ callbacks: List[Union[Callable, _custom_logger_compatible_callbacks_literal]] = 
 langfuse_default_tags: Optional[List[str]] = None
 langsmith_batch_size: Optional[int] = None
 argilla_batch_size: Optional[int] = None
+datadog_use_v1: Optional[bool] = False  # if you want to use v1 datadog logged payload
 argilla_transformation_object: Optional[Dict[str, Any]] = None
 _async_input_callback: List[Callable] = (
     []
@@ -133,7 +135,7 @@ use_client: bool = False
 ssl_verify: Union[str, bool] = True
 ssl_certificate: Optional[str] = None
 disable_streaming_logging: bool = False
-in_memory_llm_clients_cache: dict = {}
+in_memory_llm_clients_cache: InMemoryCache = InMemoryCache()
 safe_memory_mode: bool = False
 enable_azure_ad_token_refresh: Optional[bool] = False
 ### DEFAULT AZURE API VERSION ###
@@ -273,6 +275,7 @@ s3_callback_params: Optional[Dict] = None
 generic_logger_headers: Optional[Dict] = None
 default_key_generate_params: Optional[Dict] = None
 upperbound_key_generate_params: Optional[LiteLLM_UpperboundKeyGenerateParams] = None
+key_generation_settings: Optional[StandardKeyGenerationConfig] = None
 default_internal_user_params: Optional[Dict] = None
 default_team_settings: Optional[List] = None
 max_user_budget: Optional[float] = None
@@ -280,15 +283,23 @@ default_max_internal_user_budget: Optional[float] = None
 max_internal_user_budget: Optional[float] = None
 internal_user_budget_duration: Optional[str] = None
 max_end_user_budget: Optional[float] = None
+disable_end_user_cost_tracking: Optional[bool] = None
 #### REQUEST PRIORITIZATION ####
 priority_reservation: Optional[Dict[str, float]] = None
 #### RELIABILITY ####
 REPEATED_STREAMING_CHUNK_LIMIT = 100  # catch if model starts looping the same chunk while streaming. Uses high default to prevent false positives.
+
+#### Networking settings ####
 request_timeout: float = 6000  # time in seconds
+force_ipv4: bool = (
+    False  # when True, litellm will force ipv4 for all LLM requests. Some users have seen httpx ConnectionError when using ipv6.
+)
 module_level_aclient = AsyncHTTPHandler(
     timeout=request_timeout, client_alias="module level aclient"
 )
 module_level_client = HTTPHandler(timeout=request_timeout)
+
+#### RETRIES ####
 num_retries: Optional[int] = None  # per model endpoint
 max_fallbacks: Optional[int] = None
 default_fallbacks: Optional[List] = None
@@ -1125,6 +1136,7 @@ from .llms.AzureOpenAI.chat.gpt_transformation import AzureOpenAIConfig
 from .llms.hosted_vllm.chat.transformation import HostedVLLMChatConfig
 from .llms.deepseek.chat.transformation import DeepSeekChatConfig
 from .llms.lm_studio.chat.transformation import LMStudioChatConfig
+from .llms.lm_studio.embed.transformation import LmStudioEmbeddingConfig
 from .llms.perplexity.chat.transformation import PerplexityChatConfig
 from .llms.AzureOpenAI.chat.o1_transformation import AzureOpenAIO1Config
 from .llms.watsonx.completion.handler import IBMWatsonXAIConfig

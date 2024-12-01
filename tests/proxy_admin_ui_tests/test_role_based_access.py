@@ -58,8 +58,10 @@ from litellm.proxy.proxy_server import (
     image_generation,
     model_list,
     moderations,
-    new_end_user,
     user_api_key_auth,
+)
+from litellm.proxy.management_endpoints.customer_endpoints import (
+    new_end_user,
 )
 from litellm.proxy.spend_tracking.spend_management_endpoints import (
     global_spend,
@@ -158,7 +160,7 @@ async def test_create_new_user_in_organization(prisma_client, user_role):
     response = await organization_member_add(
         data=OrganizationMemberAddRequest(
             organization_id=org_id,
-            member=Member(role=user_role, user_id=created_user_id),
+            member=OrgMember(role=user_role, user_id=created_user_id),
         ),
         http_request=None,
     )
@@ -218,7 +220,7 @@ async def test_org_admin_create_team_permissions(prisma_client):
     response = await organization_member_add(
         data=OrganizationMemberAddRequest(
             organization_id=org_id,
-            member=Member(role=LitellmUserRoles.ORG_ADMIN, user_id=created_user_id),
+            member=OrgMember(role=LitellmUserRoles.ORG_ADMIN, user_id=created_user_id),
         ),
         http_request=None,
     )
@@ -290,7 +292,7 @@ async def test_org_admin_create_user_permissions(prisma_client):
     response = await organization_member_add(
         data=OrganizationMemberAddRequest(
             organization_id=org_id,
-            member=Member(role=LitellmUserRoles.ORG_ADMIN, user_id=created_user_id),
+            member=OrgMember(role=LitellmUserRoles.ORG_ADMIN, user_id=created_user_id),
         ),
         http_request=None,
     )
@@ -321,7 +323,7 @@ async def test_org_admin_create_user_permissions(prisma_client):
     response = await organization_member_add(
         data=OrganizationMemberAddRequest(
             organization_id=org_id,
-            member=Member(
+            member=OrgMember(
                 role=LitellmUserRoles.INTERNAL_USER, user_id=new_internal_user_for_org
             ),
         ),
@@ -373,7 +375,7 @@ async def test_org_admin_create_user_team_wrong_org_permissions(prisma_client):
     response = await organization_member_add(
         data=OrganizationMemberAddRequest(
             organization_id=org1_id,
-            member=Member(role=LitellmUserRoles.ORG_ADMIN, user_id=created_user_id),
+            member=OrgMember(role=LitellmUserRoles.ORG_ADMIN, user_id=created_user_id),
         ),
         http_request=None,
     )
