@@ -15,6 +15,8 @@ from respx import MockRouter
 
 import litellm
 from litellm import Choices, Message, ModelResponse
+from base_llm_unit_tests import BaseLLMChatTest
+import asyncio
 
 
 def test_openai_prediction_param():
@@ -268,3 +270,47 @@ async def test_vision_with_custom_model():
         ]
         assert request_body["model"] == "my-custom-model"
         assert request_body["max_tokens"] == 10
+
+
+class TestOpenAIChatCompletion(BaseLLMChatTest):
+    def get_base_completion_call_args(self) -> dict:
+        return {"model": "gpt-4o-mini"}
+
+    def test_tool_call_no_arguments(self, tool_call_no_arguments):
+        """Test that tool calls with no arguments is translated correctly. Relevant issue: https://github.com/BerriAI/litellm/issues/6833"""
+        pass
+
+    def test_multilingual_requests(self):
+        """
+        Tests that the provider can handle multilingual requests and invalid utf-8 sequences
+
+        Context: https://github.com/openai/openai-python/issues/1921
+        """
+        base_completion_call_args = self.get_base_completion_call_args()
+        response = self.completion_function(
+            **base_completion_call_args,
+            messages=[{"role": "user", "content": "你好世界！\ud83e, ö"}],
+        )
+        assert response is not None
+
+
+def test_completion_bad_org():
+    import litellm
+
+    litellm.set_verbose = True
+    _old_org = os.environ.get("OPENAI_ORGANIZATION", None)
+    os.environ["OPENAI_ORGANIZATION"] = "bad-org"
+    messages = [{"role": "user", "content": "hi"}]
+
+    with pytest.raises(Exception) as exc_info:
+        comp = litellm.completion(
+            model="gpt-4o-mini", messages=messages, organization="bad-org"
+        )
+
+    print(exc_info.value)
+    assert "header should match organization for API key" in str(exc_info.value)
+
+    if _old_org is not None:
+        os.environ["OPENAI_ORGANIZATION"] = _old_org
+    else:
+        del os.environ["OPENAI_ORGANIZATION"]

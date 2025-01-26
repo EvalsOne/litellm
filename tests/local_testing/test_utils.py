@@ -6,6 +6,8 @@ from unittest import mock
 
 from dotenv import load_dotenv
 
+from litellm.types.utils import StandardCallbackDynamicParams
+
 load_dotenv()
 import os
 
@@ -18,8 +20,10 @@ import litellm
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, headers
 from litellm.proxy.utils import (
     duration_in_seconds,
-    _extract_from_regex,
+)
+from litellm.litellm_core_utils.duration_parser import (
     get_last_day_of_month,
+    _extract_from_regex,
 )
 from litellm.utils import (
     check_valid_key,
@@ -35,6 +39,8 @@ from litellm.utils import (
     trim_messages,
     validate_environment,
 )
+from unittest.mock import AsyncMock, MagicMock, patch
+
 
 # Assuming your trim_messages, shorten_message_to_fit_limit, and get_token_count functions are all in a module named 'message_utils'
 
@@ -435,8 +441,8 @@ def test_token_counter():
         print(tokens)
         assert tokens > 0
 
-        tokens = token_counter(model="palm/chat-bison", messages=messages)
-        print("palm/chat-bison")
+        tokens = token_counter(model="gemini/chat-bison", messages=messages)
+        print("gemini/chat-bison")
         print(tokens)
         assert tokens > 0
 
@@ -463,7 +469,7 @@ def test_token_counter():
         ("azure/gpt-4-1106-preview", True),
         ("groq/gemma-7b-it", True),
         ("anthropic.claude-instant-v1", False),
-        ("palm/chat-bison", False),
+        ("gemini/gemini-1.5-flash", True),
     ],
 )
 def test_supports_function_calling(model, expected_bool):
@@ -492,6 +498,37 @@ def test_get_supported_openai_params() -> None:
 
     # Unmapped provider
     assert get_supported_openai_params("nonexistent") is None
+
+
+def test_get_chat_completion_prompt():
+    """
+    Unit test to ensure get_chat_completion_prompt updates messages in logging object.
+    """
+    from litellm.litellm_core_utils.litellm_logging import Logging
+
+    litellm_logging_obj = Logging(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=False,
+        call_type="acompletion",
+        litellm_call_id="1234",
+        start_time=datetime.now(),
+        function_id="1234",
+    )
+
+    updated_message = "hello world"
+
+    litellm_logging_obj.get_chat_completion_prompt(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": updated_message}],
+        non_default_params={},
+        prompt_id="1234",
+        prompt_variables=None,
+    )
+
+    assert litellm_logging_obj.messages == [
+        {"role": "user", "content": updated_message}
+    ]
 
 
 def test_redact_msgs_from_logs():
@@ -541,6 +578,92 @@ def test_redact_msgs_from_logs():
         == "I'm LLaMA, an AI assistant developed by Meta AI that can understand and respond to human input in a conversational manner."
     )
 
+    litellm.turn_off_message_logging = False
+    print("Test passed")
+
+
+def test_redact_msgs_from_logs_with_dynamic_params():
+    """
+    Tests redaction behavior based on standard_callback_dynamic_params setting:
+    In all tests litellm.turn_off_message_logging is True
+
+
+    1. When standard_callback_dynamic_params.turn_off_message_logging is False (or not set): No redaction should occur. User has opted out of redaction.
+    2. When standard_callback_dynamic_params.turn_off_message_logging is True: Redaction should occur. User has opted in to redaction.
+    3. standard_callback_dynamic_params.turn_off_message_logging not set, litellm.turn_off_message_logging is True: Redaction should occur.
+    """
+    from litellm.litellm_core_utils.litellm_logging import Logging
+    from litellm.litellm_core_utils.redact_messages import (
+        redact_message_input_output_from_logging,
+    )
+
+    litellm.turn_off_message_logging = True
+    test_content = "I'm LLaMA, an AI assistant developed by Meta AI that can understand and respond to human input in a conversational manner."
+    response_obj = litellm.ModelResponse(
+        choices=[
+            {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                    "content": test_content,
+                    "role": "assistant",
+                },
+            }
+        ]
+    )
+
+    litellm_logging_obj = Logging(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=False,
+        call_type="acompletion",
+        litellm_call_id="1234",
+        start_time=datetime.now(),
+        function_id="1234",
+    )
+
+    # Test Case 1: standard_callback_dynamic_params = False (or not set)
+    standard_callback_dynamic_params = StandardCallbackDynamicParams(
+        turn_off_message_logging=False
+    )
+    litellm_logging_obj.model_call_details["standard_callback_dynamic_params"] = (
+        standard_callback_dynamic_params
+    )
+    _redacted_response_obj = redact_message_input_output_from_logging(
+        result=response_obj,
+        model_call_details=litellm_logging_obj.model_call_details,
+    )
+    # Assert no redaction occurred
+    assert _redacted_response_obj.choices[0].message.content == test_content
+
+    # Test Case 2: standard_callback_dynamic_params = True
+    standard_callback_dynamic_params = StandardCallbackDynamicParams(
+        turn_off_message_logging=True
+    )
+    litellm_logging_obj.model_call_details["standard_callback_dynamic_params"] = (
+        standard_callback_dynamic_params
+    )
+    _redacted_response_obj = redact_message_input_output_from_logging(
+        result=response_obj,
+        model_call_details=litellm_logging_obj.model_call_details,
+    )
+    # Assert redaction occurred
+    assert _redacted_response_obj.choices[0].message.content == "redacted-by-litellm"
+
+    # Test Case 3: standard_callback_dynamic_params does not override litellm.turn_off_message_logging
+    # since litellm.turn_off_message_logging is True redaction should occur
+    standard_callback_dynamic_params = StandardCallbackDynamicParams()
+    litellm_logging_obj.model_call_details["standard_callback_dynamic_params"] = (
+        standard_callback_dynamic_params
+    )
+    _redacted_response_obj = redact_message_input_output_from_logging(
+        result=response_obj,
+        model_call_details=litellm_logging_obj.model_call_details,
+    )
+    # Assert no redaction occurred
+    assert _redacted_response_obj.choices[0].message.content == "redacted-by-litellm"
+
+    # Reset settings
     litellm.turn_off_message_logging = False
     print("Test passed")
 
@@ -993,6 +1116,26 @@ def test_validate_chat_completion_user_messages(messages, expected_bool):
             validate_chat_completion_user_messages(messages=messages)
 
 
+@pytest.mark.parametrize(
+    "tool_choice, expected_bool",
+    [
+        ({"type": "function", "function": {"name": "get_current_weather"}}, True),
+        ({"type": "tool", "name": "get_current_weather"}, False),
+        (None, True),
+        ("auto", True),
+        ("required", True),
+    ],
+)
+def test_validate_chat_completion_tool_choice(tool_choice, expected_bool):
+    from litellm.utils import validate_chat_completion_tool_choice
+
+    if expected_bool:
+        validate_chat_completion_tool_choice(tool_choice=tool_choice)
+    else:
+        with pytest.raises(Exception):
+            validate_chat_completion_tool_choice(tool_choice=tool_choice)
+
+
 def test_models_by_provider():
     """
     Make sure all providers from model map are in the valid providers list
@@ -1005,7 +1148,10 @@ def test_models_by_provider():
             continue
         elif k == "sample_spec":
             continue
-        elif v["litellm_provider"] == "sagemaker":
+        elif (
+            v["litellm_provider"] == "sagemaker"
+            or v["litellm_provider"] == "bedrock_converse"
+        ):
             continue
         else:
             providers.add(v["litellm_provider"])
@@ -1018,8 +1164,8 @@ def test_models_by_provider():
     "litellm_params, disable_end_user_cost_tracking, expected_end_user_id",
     [
         ({}, False, None),
-        ({"proxy_server_request": {"body": {"user": "123"}}}, False, "123"),
-        ({"proxy_server_request": {"body": {"user": "123"}}}, True, None),
+        ({"user_api_key_end_user_id": "123"}, False, "123"),
+        ({"user_api_key_end_user_id": "123"}, True, None),
     ],
 )
 def test_get_end_user_id_for_cost_tracking(
@@ -1032,3 +1178,438 @@ def test_get_end_user_id_for_cost_tracking(
         get_end_user_id_for_cost_tracking(litellm_params=litellm_params)
         == expected_end_user_id
     )
+
+
+@pytest.mark.parametrize(
+    "litellm_params, disable_end_user_cost_tracking_prometheus_only, expected_end_user_id",
+    [
+        ({}, False, None),
+        ({"user_api_key_end_user_id": "123"}, False, "123"),
+        ({"user_api_key_end_user_id": "123"}, True, None),
+    ],
+)
+def test_get_end_user_id_for_cost_tracking_prometheus_only(
+    litellm_params, disable_end_user_cost_tracking_prometheus_only, expected_end_user_id
+):
+    from litellm.utils import get_end_user_id_for_cost_tracking
+
+    litellm.disable_end_user_cost_tracking_prometheus_only = (
+        disable_end_user_cost_tracking_prometheus_only
+    )
+    assert (
+        get_end_user_id_for_cost_tracking(
+            litellm_params=litellm_params, service_type="prometheus"
+        )
+        == expected_end_user_id
+    )
+
+
+def test_is_prompt_caching_enabled_error_handling():
+    """
+    Assert that `is_prompt_caching_valid_prompt` safely handles errors in `token_counter`.
+    """
+    with patch(
+        "litellm.utils.token_counter",
+        side_effect=Exception(
+            "Mocked error, This should not raise an error. Instead is_prompt_caching_valid_prompt should return False."
+        ),
+    ):
+        result = litellm.utils.is_prompt_caching_valid_prompt(
+            messages=[{"role": "user", "content": "test"}],
+            tools=None,
+            custom_llm_provider="anthropic",
+            model="anthropic/claude-3-5-sonnet-20240620",
+        )
+
+        assert result is False  # Should return False when an error occurs
+
+
+def test_is_prompt_caching_enabled_return_default_image_dimensions():
+    """
+    Assert that `is_prompt_caching_valid_prompt` calls token_counter with use_default_image_token_count=True
+    when processing messages containing images
+
+    IMPORTANT: Ensures Get token counter does not make a GET request to the image url
+    """
+    with patch("litellm.utils.token_counter") as mock_token_counter:
+        litellm.utils.is_prompt_caching_valid_prompt(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What is in this image?"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://www.gstatic.com/webp/gallery/1.webp",
+                                "detail": "high",
+                            },
+                        },
+                    ],
+                }
+            ],
+            tools=None,
+            custom_llm_provider="openai",
+            model="gpt-4o-mini",
+        )
+
+        # Assert token_counter was called with use_default_image_token_count=True
+        args_to_mock_token_counter = mock_token_counter.call_args[1]
+        print("args_to_mock", args_to_mock_token_counter)
+        assert args_to_mock_token_counter["use_default_image_token_count"] is True
+
+
+def test_token_counter_with_image_url_with_detail_high():
+    """
+    Assert that token_counter does not make a GET request to the image url when `use_default_image_token_count=True`
+
+    PROD TEST this is importat - Can impact latency very badly
+    """
+    from litellm.constants import DEFAULT_IMAGE_TOKEN_COUNT
+    from litellm._logging import verbose_logger
+    import logging
+
+    verbose_logger.setLevel(logging.DEBUG)
+
+    _tokens = litellm.utils.token_counter(
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "https://www.gstatic.com/webp/gallery/1.webp",
+                            "detail": "high",
+                        },
+                    },
+                ],
+            }
+        ],
+        model="gpt-4o-mini",
+        use_default_image_token_count=True,
+    )
+    print("tokens", _tokens)
+    assert _tokens == DEFAULT_IMAGE_TOKEN_COUNT + 7
+
+
+def test_fireworks_ai_document_inlining():
+    """
+    With document inlining, all fireworks ai models are now:
+    - supports_pdf
+    - supports_vision
+    """
+    from litellm.utils import supports_pdf_input, supports_vision
+
+    litellm._turn_on_debug()
+
+    assert supports_pdf_input("fireworks_ai/llama-3.1-8b-instruct") is True
+    assert supports_vision("fireworks_ai/llama-3.1-8b-instruct") is True
+
+
+def test_logprobs_type():
+    from litellm.types.utils import Logprobs
+
+    logprobs = {
+        "text_offset": None,
+        "token_logprobs": None,
+        "tokens": None,
+        "top_logprobs": None,
+    }
+    logprobs = Logprobs(**logprobs)
+    assert logprobs.text_offset is None
+    assert logprobs.token_logprobs is None
+    assert logprobs.tokens is None
+    assert logprobs.top_logprobs is None
+
+
+def test_get_valid_models_openai_proxy(monkeypatch):
+    from litellm.utils import get_valid_models
+    import litellm
+
+    litellm._turn_on_debug()
+
+    monkeypatch.setenv("LITELLM_PROXY_API_KEY", "sk-1234")
+    monkeypatch.setenv("LITELLM_PROXY_API_BASE", "https://litellm-api.up.railway.app/")
+    monkeypatch.delenv("FIREWORKS_AI_ACCOUNT_ID", None)
+    monkeypatch.delenv("FIREWORKS_AI_API_KEY", None)
+
+    mock_response_data = {
+        "object": "list",
+        "data": [
+            {
+                "id": "gpt-4o",
+                "object": "model",
+                "created": 1686935002,
+                "owned_by": "organization-owner",
+            },
+        ],
+    }
+
+    # Create a mock response object
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = mock_response_data
+
+    with patch.object(
+        litellm.module_level_client, "get", return_value=mock_response
+    ) as mock_post:
+        valid_models = get_valid_models(check_provider_endpoint=True)
+        assert "litellm_proxy/gpt-4o" in valid_models
+
+
+def test_get_valid_models_fireworks_ai(monkeypatch):
+    from litellm.utils import get_valid_models
+    import litellm
+
+    litellm._turn_on_debug()
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "sk-1234")
+    monkeypatch.setenv("FIREWORKS_ACCOUNT_ID", "1234")
+    monkeypatch.setattr(litellm, "provider_list", ["fireworks_ai"])
+
+    mock_response_data = {
+        "models": [
+            {
+                "name": "accounts/fireworks/models/llama-3.1-8b-instruct",
+                "displayName": "<string>",
+                "description": "<string>",
+                "createTime": "2023-11-07T05:31:56Z",
+                "createdBy": "<string>",
+                "state": "STATE_UNSPECIFIED",
+                "status": {"code": "OK", "message": "<string>"},
+                "kind": "KIND_UNSPECIFIED",
+                "githubUrl": "<string>",
+                "huggingFaceUrl": "<string>",
+                "baseModelDetails": {
+                    "worldSize": 123,
+                    "checkpointFormat": "CHECKPOINT_FORMAT_UNSPECIFIED",
+                    "parameterCount": "<string>",
+                    "moe": True,
+                    "tunable": True,
+                },
+                "peftDetails": {
+                    "baseModel": "<string>",
+                    "r": 123,
+                    "targetModules": ["<string>"],
+                },
+                "teftDetails": {},
+                "public": True,
+                "conversationConfig": {
+                    "style": "<string>",
+                    "system": "<string>",
+                    "template": "<string>",
+                },
+                "contextLength": 123,
+                "supportsImageInput": True,
+                "supportsTools": True,
+                "importedFrom": "<string>",
+                "fineTuningJob": "<string>",
+                "defaultDraftModel": "<string>",
+                "defaultDraftTokenCount": 123,
+                "precisions": ["PRECISION_UNSPECIFIED"],
+                "deployedModelRefs": [
+                    {
+                        "name": "<string>",
+                        "deployment": "<string>",
+                        "state": "STATE_UNSPECIFIED",
+                        "default": True,
+                        "public": True,
+                    }
+                ],
+                "cluster": "<string>",
+                "deprecationDate": {"year": 123, "month": 123, "day": 123},
+            }
+        ],
+        "nextPageToken": "<string>",
+        "totalSize": 123,
+    }
+
+    # Create a mock response object
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = mock_response_data
+
+    with patch.object(
+        litellm.module_level_client, "get", return_value=mock_response
+    ) as mock_post:
+        valid_models = get_valid_models(check_provider_endpoint=True)
+        mock_post.assert_called_once()
+        assert (
+            "fireworks_ai/accounts/fireworks/models/llama-3.1-8b-instruct"
+            in valid_models
+        )
+
+
+def test_get_valid_models_default(monkeypatch):
+    """
+    Ensure that the default models is used when error retrieving from model api.
+
+    Prevent regression for existing usage.
+    """
+    from litellm.utils import get_valid_models
+    import litellm
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "sk-1234")
+    valid_models = get_valid_models()
+    assert len(valid_models) > 0
+
+
+def test_supports_vision_gemini():
+    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    litellm.model_cost = litellm.get_model_cost_map(url="")
+    from litellm.utils import supports_vision
+
+    assert supports_vision("gemini-1.5-pro") is True
+
+
+def test_pick_cheapest_chat_model_from_llm_provider():
+    from litellm.litellm_core_utils.llm_request_utils import (
+        pick_cheapest_chat_models_from_llm_provider,
+    )
+
+    assert len(pick_cheapest_chat_models_from_llm_provider("openai", n=3)) == 3
+
+    assert len(pick_cheapest_chat_models_from_llm_provider("unknown", n=1)) == 0
+
+
+def test_get_potential_model_names():
+    from litellm.utils import _get_potential_model_names
+
+    assert _get_potential_model_names(
+        model="bedrock/ap-northeast-1/anthropic.claude-instant-v1",
+        custom_llm_provider="bedrock",
+    )
+
+
+@pytest.mark.parametrize("num_retries", [0, 1, 5])
+def test_get_num_retries(num_retries):
+    from litellm.utils import _get_wrapper_num_retries
+
+    assert _get_wrapper_num_retries(
+        kwargs={"num_retries": num_retries}, exception=Exception("test")
+    ) == (
+        num_retries,
+        {
+            "num_retries": num_retries,
+        },
+    )
+
+
+def test_add_custom_logger_callback_to_specific_event(monkeypatch):
+    from litellm.utils import _add_custom_logger_callback_to_specific_event
+
+    monkeypatch.setattr(litellm, "success_callback", [])
+    monkeypatch.setattr(litellm, "failure_callback", [])
+
+    _add_custom_logger_callback_to_specific_event("langfuse", "success")
+
+    assert len(litellm.success_callback) == 1
+    assert len(litellm.failure_callback) == 0
+
+
+def test_add_custom_logger_callback_to_specific_event_e2e(monkeypatch):
+
+    monkeypatch.setattr(litellm, "success_callback", [])
+    monkeypatch.setattr(litellm, "failure_callback", [])
+    monkeypatch.setattr(litellm, "callbacks", [])
+
+    litellm.success_callback = ["humanloop"]
+
+    curr_len_success_callback = len(litellm.success_callback)
+    curr_len_failure_callback = len(litellm.failure_callback)
+
+    litellm.completion(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": "Hello, world!"}],
+        mock_response="Testing langfuse",
+    )
+
+    assert len(litellm.success_callback) == curr_len_success_callback
+    assert len(litellm.failure_callback) == curr_len_failure_callback
+
+
+@pytest.mark.asyncio
+async def test_wrapper_kwargs_passthrough():
+    from litellm.utils import client
+    from litellm.litellm_core_utils.litellm_logging import (
+        Logging as LiteLLMLoggingObject,
+    )
+
+    # Create mock original function
+    mock_original = AsyncMock()
+
+    # Apply decorator
+    @client
+    async def test_function(**kwargs):
+        return await mock_original(**kwargs)
+
+    # Test kwargs
+    test_kwargs = {"base_model": "gpt-4o-mini"}
+
+    # Call decorated function
+    await test_function(**test_kwargs)
+
+    mock_original.assert_called_once()
+
+    # get litellm logging object
+    litellm_logging_obj: LiteLLMLoggingObject = mock_original.call_args.kwargs.get(
+        "litellm_logging_obj"
+    )
+    assert litellm_logging_obj is not None
+
+    print(
+        f"litellm_logging_obj.model_call_details: {litellm_logging_obj.model_call_details}"
+    )
+
+    # get base model
+    assert (
+        litellm_logging_obj.model_call_details["litellm_params"]["base_model"]
+        == "gpt-4o-mini"
+    )
+
+
+def test_dict_to_response_format_helper():
+    from litellm.llms.base_llm.base_utils import _dict_to_response_format_helper
+
+    args = {
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "schema": {
+                    "$defs": {
+                        "CalendarEvent": {
+                            "properties": {
+                                "name": {"title": "Name", "type": "string"},
+                                "date": {"title": "Date", "type": "string"},
+                                "participants": {
+                                    "items": {"type": "string"},
+                                    "title": "Participants",
+                                    "type": "array",
+                                },
+                            },
+                            "required": ["name", "date", "participants"],
+                            "title": "CalendarEvent",
+                            "type": "object",
+                            "additionalProperties": False,
+                        }
+                    },
+                    "properties": {
+                        "events": {
+                            "items": {"$ref": "#/$defs/CalendarEvent"},
+                            "title": "Events",
+                            "type": "array",
+                        }
+                    },
+                    "required": ["events"],
+                    "title": "EventsList",
+                    "type": "object",
+                    "additionalProperties": False,
+                },
+                "name": "EventsList",
+                "strict": True,
+            },
+        },
+        "ref_template": "/$defs/{model}",
+    }
+    _dict_to_response_format_helper(**args)

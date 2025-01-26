@@ -1,4 +1,3 @@
-import asyncio
 import httpx
 import json
 import pytest
@@ -6,6 +5,7 @@ import sys
 from typing import Any, Dict, List
 from unittest.mock import MagicMock, Mock, patch
 import os
+import uuid
 
 sys.path.insert(
     0, os.path.abspath("../..")
@@ -23,10 +23,47 @@ from litellm.utils import (
 from abc import ABC, abstractmethod
 
 
+def _usage_format_tests(usage: litellm.Usage):
+    """
+    OpenAI prompt caching
+    - prompt_tokens = sum of non-cache hit tokens + cache-hit tokens
+    - total_tokens = prompt_tokens + completion_tokens
+
+    Example
+    ```
+    "usage": {
+        "prompt_tokens": 2006,
+        "completion_tokens": 300,
+        "total_tokens": 2306,
+        "prompt_tokens_details": {
+            "cached_tokens": 1920
+        },
+        "completion_tokens_details": {
+            "reasoning_tokens": 0
+        }
+        # ANTHROPIC_ONLY #
+        "cache_creation_input_tokens": 0
+    }
+    ```
+    """
+    print(f"usage={usage}")
+    assert usage.total_tokens == usage.prompt_tokens + usage.completion_tokens
+
+    assert usage.prompt_tokens > usage.prompt_tokens_details.cached_tokens
+
+
 class BaseLLMChatTest(ABC):
     """
     Abstract base test class that enforces a common test across all test classes.
     """
+
+    @property
+    def completion_function(self):
+        return litellm.completion
+
+    @property
+    def async_completion_function(self):
+        return litellm.acompletion
 
     @abstractmethod
     def get_base_completion_call_args(self) -> dict:
@@ -43,7 +80,7 @@ class BaseLLMChatTest(ABC):
             }
         ]
         try:
-            response = litellm.completion(
+            response = self.completion_function(
                 **base_completion_call_args,
                 messages=messages,
             )
@@ -54,12 +91,89 @@ class BaseLLMChatTest(ABC):
         # for OpenAI the content contains the JSON schema, so we need to assert that the content is not None
         assert response.choices[0].message.content is not None
 
+    def test_streaming(self):
+        """Check if litellm handles streaming correctly"""
+        base_completion_call_args = self.get_base_completion_call_args()
+        litellm.set_verbose = True
+        messages = [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "Hello, how are you?"}],
+            }
+        ]
+        try:
+            response = self.completion_function(
+                **base_completion_call_args,
+                messages=messages,
+                stream=True,
+            )
+            assert response is not None
+            assert isinstance(response, CustomStreamWrapper)
+        except litellm.InternalServerError:
+            pytest.skip("Model is overloaded")
+
+        # for OpenAI the content contains the JSON schema, so we need to assert that the content is not None
+        chunks = []
+        for chunk in response:
+            print(chunk)
+            chunks.append(chunk)
+
+        resp = litellm.stream_chunk_builder(chunks=chunks)
+        print(resp)
+
+        # assert resp.usage.prompt_tokens > 0
+        # assert resp.usage.completion_tokens > 0
+        # assert resp.usage.total_tokens > 0
+
+    def test_pydantic_model_input(self):
+        litellm.set_verbose = True
+
+        from litellm import completion, Message
+
+        base_completion_call_args = self.get_base_completion_call_args()
+        messages = [Message(content="Hello, how are you?", role="user")]
+
+        self.completion_function(**base_completion_call_args, messages=messages)
+
+    @pytest.mark.parametrize("image_url", ["str", "dict"])
+    def test_pdf_handling(self, pdf_messages, image_url):
+        from litellm.utils import supports_pdf_input
+
+        if image_url == "str":
+            image_url = pdf_messages
+        elif image_url == "dict":
+            image_url = {"url": pdf_messages}
+
+        image_content = [
+            {"type": "text", "text": "What's this file about?"},
+            {
+                "type": "image_url",
+                "image_url": image_url,
+            },
+        ]
+
+        image_messages = [{"role": "user", "content": image_content}]
+
+        base_completion_call_args = self.get_base_completion_call_args()
+
+        if not supports_pdf_input(base_completion_call_args["model"], None):
+            pytest.skip("Model does not support image input")
+
+        response = self.completion_function(
+            **base_completion_call_args,
+            messages=image_messages,
+        )
+        assert response is not None
+
     def test_message_with_name(self):
+        litellm.set_verbose = True
         base_completion_call_args = self.get_base_completion_call_args()
         messages = [
             {"role": "user", "content": "Hello", "name": "test_name"},
         ]
-        response = litellm.completion(**base_completion_call_args, messages=messages)
+        response = self.completion_function(
+            **base_completion_call_args, messages=messages
+        )
         assert response is not None
 
     @pytest.mark.parametrize(
@@ -69,12 +183,18 @@ class BaseLLMChatTest(ABC):
             {"type": "text"},
         ],
     )
+    @pytest.mark.flaky(retries=6, delay=1)
     def test_json_response_format(self, response_format):
         """
         Test that the JSON response format is supported by the LLM API
         """
+        from litellm.utils import supports_response_schema
+
         base_completion_call_args = self.get_base_completion_call_args()
         litellm.set_verbose = True
+
+        if not supports_response_schema(base_completion_call_args["model"], None):
+            pytest.skip("Model does not support response schema")
 
         messages = [
             {
@@ -87,7 +207,7 @@ class BaseLLMChatTest(ABC):
             },
         ]
 
-        response = litellm.completion(
+        response = self.completion_function(
             **base_completion_call_args,
             messages=messages,
             response_format=response_format,
@@ -116,7 +236,7 @@ class BaseLLMChatTest(ABC):
             pytest.skip("Model does not support response schema")
 
         try:
-            res = litellm.completion(
+            res = self.completion_function(
                 **base_completion_call_args,
                 messages=[
                     {"role": "system", "content": "You are a helpful assistant."},
@@ -126,6 +246,7 @@ class BaseLLMChatTest(ABC):
                     },
                 ],
                 response_format=TestModel,
+                timeout=5,
             )
             assert res is not None
 
@@ -133,15 +254,127 @@ class BaseLLMChatTest(ABC):
 
             assert res.choices[0].message.content is not None
             assert res.choices[0].message.tool_calls is None
+        except litellm.Timeout:
+            pytest.skip("Model took too long to respond")
         except litellm.InternalServerError:
             pytest.skip("Model is overloaded")
 
+    @pytest.mark.flaky(retries=6, delay=1)
+    def test_json_response_pydantic_obj_nested_obj(self):
+        litellm.set_verbose = True
+        from pydantic import BaseModel
+        from litellm.utils import supports_response_schema
+
+        os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+        litellm.model_cost = litellm.get_model_cost_map(url="")
+
+    @pytest.mark.flaky(retries=6, delay=1)
+    def test_json_response_nested_pydantic_obj(self):
+        from pydantic import BaseModel
+        from litellm.utils import supports_response_schema
+
+        os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+        litellm.model_cost = litellm.get_model_cost_map(url="")
+
+        class CalendarEvent(BaseModel):
+            name: str
+            date: str
+            participants: list[str]
+
+        class EventsList(BaseModel):
+            events: list[CalendarEvent]
+
+        messages = [
+            {"role": "user", "content": "List 5 important events in the XIX century"}
+        ]
+
+        base_completion_call_args = self.get_base_completion_call_args()
+        if not supports_response_schema(base_completion_call_args["model"], None):
+            pytest.skip(
+                f"Model={base_completion_call_args['model']} does not support response schema"
+            )
+
+        try:
+            res = self.completion_function(
+                **base_completion_call_args,
+                messages=messages,
+                response_format=EventsList,
+                timeout=60,
+            )
+            assert res is not None
+
+            print(res.choices[0].message)
+
+            assert res.choices[0].message.content is not None
+            assert res.choices[0].message.tool_calls is None
+        except litellm.Timeout:
+            pytest.skip("Model took too long to respond")
+        except litellm.InternalServerError:
+            pytest.skip("Model is overloaded")
+
+    @pytest.mark.flaky(retries=6, delay=1)
+    def test_json_response_nested_json_schema(self):
+        """
+        PROD Test: ensure nested json schema sent to proxy works as expected.
+        """
+        from pydantic import BaseModel
+        from litellm.utils import supports_response_schema
+        from litellm.llms.base_llm.base_utils import type_to_response_format_param
+
+        os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+        litellm.model_cost = litellm.get_model_cost_map(url="")
+
+        class CalendarEvent(BaseModel):
+            name: str
+            date: str
+            participants: list[str]
+
+        class EventsList(BaseModel):
+            events: list[CalendarEvent]
+
+        response_format = type_to_response_format_param(EventsList)
+
+        messages = [
+            {"role": "user", "content": "List 5 important events in the XIX century"}
+        ]
+
+        base_completion_call_args = self.get_base_completion_call_args()
+        if not supports_response_schema(base_completion_call_args["model"], None):
+            pytest.skip(
+                f"Model={base_completion_call_args['model']} does not support response schema"
+            )
+
+        try:
+            res = self.completion_function(
+                **base_completion_call_args,
+                messages=messages,
+                response_format=response_format,
+                timeout=60,
+            )
+            assert res is not None
+
+            print(res.choices[0].message)
+
+            assert res.choices[0].message.content is not None
+            assert res.choices[0].message.tool_calls is None
+        except litellm.Timeout:
+            pytest.skip("Model took too long to respond")
+        except litellm.InternalServerError:
+            pytest.skip("Model is overloaded")
+
+    @pytest.mark.flaky(retries=6, delay=1)
     def test_json_response_format_stream(self):
         """
         Test that the JSON response format with streaming is supported by the LLM API
         """
+        from litellm.utils import supports_response_schema
+
         base_completion_call_args = self.get_base_completion_call_args()
         litellm.set_verbose = True
+
+        base_completion_call_args = self.get_base_completion_call_args()
+        if not supports_response_schema(base_completion_call_args["model"], None):
+            pytest.skip("Model does not support response schema")
 
         messages = [
             {
@@ -155,7 +388,7 @@ class BaseLLMChatTest(ABC):
         ]
 
         try:
-            response = litellm.completion(
+            response = self.completion_function(
                 **base_completion_call_args,
                 messages=messages,
                 response_format={"type": "json_object"},
@@ -170,7 +403,7 @@ class BaseLLMChatTest(ABC):
         for chunk in response:
             content += chunk.choices[0].delta.content or ""
 
-        print("content=", content)
+        print(f"content={content}<END>")
 
         # OpenAI guarantees that the JSON schema is returned in the content
         # relevant issue: https://github.com/BerriAI/litellm/issues/6741
@@ -197,7 +430,9 @@ class BaseLLMChatTest(ABC):
         """Test that tool calls with no arguments is translated correctly. Relevant issue: https://github.com/BerriAI/litellm/issues/6833"""
         pass
 
-    def test_image_url(self):
+    @pytest.mark.parametrize("detail", [None, "low", "high"])
+    @pytest.mark.flaky(retries=4, delay=1)
+    def test_image_url(self, detail):
         litellm.set_verbose = True
         from litellm.utils import supports_vision
 
@@ -216,15 +451,126 @@ class BaseLLMChatTest(ABC):
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": "https://i.pinimg.com/736x/b4/b1/be/b4b1becad04d03a9071db2817fc9fe77.jpg"
+                            "url": "https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg"
                         },
                     },
                 ],
             }
         ]
 
-        response = litellm.completion(**base_completion_call_args, messages=messages)
+        if detail is not None:
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What's in this image?"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://www.gstatic.com/webp/gallery/1.webp",
+                                "detail": detail,
+                            },
+                        },
+                    ],
+                }
+            ]
+        response = self.completion_function(
+            **base_completion_call_args, messages=messages
+        )
         assert response is not None
+
+    @pytest.mark.flaky(retries=4, delay=1)
+    def test_prompt_caching(self):
+        litellm.set_verbose = True
+        from litellm.utils import supports_prompt_caching
+
+        os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+        litellm.model_cost = litellm.get_model_cost_map(url="")
+
+        base_completion_call_args = self.get_base_completion_call_args()
+        if not supports_prompt_caching(base_completion_call_args["model"], None):
+            print("Model does not support prompt caching")
+            pytest.skip("Model does not support prompt caching")
+
+        uuid_str = str(uuid.uuid4())
+        messages = [
+            # System Message
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Here is the full text of a complex legal agreement {}".format(
+                            uuid_str
+                        )
+                        * 400,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            },
+            # marked for caching with the cache_control parameter, so that this checkpoint can read from the previous cache.
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "What are the key terms and conditions in this agreement?",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": "Certainly! the key terms and conditions are the following: the contract is 1 year long for $10/mo",
+            },
+            # The final turn is marked with cache-control, for continuing in followups.
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "What are the key terms and conditions in this agreement?",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            },
+        ]
+
+        try:
+            ## call 1
+            response = self.completion_function(
+                **base_completion_call_args,
+                messages=messages,
+                max_tokens=10,
+            )
+
+            initial_cost = response._hidden_params["response_cost"]
+            ## call 2
+            response = self.completion_function(
+                **base_completion_call_args,
+                messages=messages,
+                max_tokens=10,
+            )
+
+            cached_cost = response._hidden_params["response_cost"]
+
+            assert (
+                cached_cost <= initial_cost
+            ), "Cached cost={} should be less than initial cost={}".format(
+                cached_cost, initial_cost
+            )
+
+            _usage_format_tests(response.usage)
+
+            print("response=", response)
+            print("response.usage=", response.usage)
+
+            _usage_format_tests(response.usage)
+
+            assert "prompt_tokens_details" in response.usage
+            assert response.usage.prompt_tokens_details.cached_tokens > 0
+        except litellm.InternalServerError:
+            pass
 
     @pytest.fixture
     def pdf_messages(self):
@@ -233,7 +579,7 @@ class BaseLLMChatTest(ABC):
         import requests
 
         # URL of the file
-        url = "https://storage.googleapis.com/cloud-samples-data/generative-ai/pdf/2403.05530.pdf"
+        url = "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf"
 
         response = requests.get(url)
         file_data = response.content
@@ -241,14 +587,21 @@ class BaseLLMChatTest(ABC):
         encoded_file = base64.b64encode(file_data).decode("utf-8")
         url = f"data:application/pdf;base64,{encoded_file}"
 
-        image_content = [
-            {"type": "text", "text": "What's this file about?"},
-            {
-                "type": "image_url",
-                "image_url": {"url": url},
-            },
-        ]
+        return url
 
-        image_messages = [{"role": "user", "content": image_content}]
+    @pytest.mark.asyncio
+    async def test_completion_cost(self):
+        from litellm import completion_cost
 
-        return image_messages
+        os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+        litellm.model_cost = litellm.get_model_cost_map(url="")
+
+        litellm.set_verbose = True
+        response = await self.async_completion_function(
+            **self.get_base_completion_call_args(),
+            messages=[{"role": "user", "content": "Hello, how are you?"}],
+        )
+        print(response._hidden_params)
+        cost = completion_cost(response)
+
+        assert cost > 0

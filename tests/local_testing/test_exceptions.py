@@ -1176,3 +1176,32 @@ async def test_bad_request_error_contains_httpx_response(model):
         print("e.response", e.response)
         print("vars(e.response)", vars(e.response))
         assert e.response is not None
+
+
+def test_exceptions_base_class():
+    try:
+        raise litellm.RateLimitError(
+            message="BedrockException: Rate Limit Error",
+            model="model",
+            llm_provider="bedrock",
+        )
+    except litellm.RateLimitError as e:
+        assert isinstance(e, litellm.RateLimitError)
+        assert e.code == "429"
+        assert e.type == "throttling_error"
+
+
+def test_context_window_exceeded_error_from_litellm_proxy():
+    from httpx import Response
+    from litellm.litellm_core_utils.exception_mapping_utils import (
+        extract_and_raise_litellm_exception,
+    )
+
+    args = {
+        "response": Response(status_code=400, text="Bad Request"),
+        "error_str": "Error code: 400 - {'error': {'message': \"litellm.ContextWindowExceededError: litellm.BadRequestError: this is a mock context window exceeded error\\nmodel=gpt-3.5-turbo. context_window_fallbacks=None. fallbacks=None.\\n\\nSet 'context_window_fallback' - https://docs.litellm.ai/docs/routing#fallbacks\\nReceived Model Group=gpt-3.5-turbo\\nAvailable Model Group Fallbacks=None\", 'type': None, 'param': None, 'code': '400'}}",
+        "model": "gpt-3.5-turbo",
+        "custom_llm_provider": "litellm_proxy",
+    }
+    with pytest.raises(litellm.ContextWindowExceededError):
+        extract_and_raise_litellm_exception(**args)
