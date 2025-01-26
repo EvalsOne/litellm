@@ -1216,11 +1216,13 @@ def _select_tokenizer(model: str):
         ):
             return {"type": "openai_tokenizer", "tokenizer": encoding}
 
-        try:
-            tokenizer = Tokenizer.from_pretrained(model)
-            return {"type": "huggingface_tokenizer", "tokenizer": tokenizer}
-        except Exception:
-            return {"type": "openai_tokenizer", "tokenizer": encoding}
+        return {"type": "openai_tokenizer", "tokenizer": encoding}
+
+        # try:
+        #     tokenizer = Tokenizer.from_pretrained(model)
+        #     return {"type": "huggingface_tokenizer", "tokenizer": tokenizer}
+        # except Exception:
+        #     return {"type": "openai_tokenizer", "tokenizer": encoding}
 
 
 def encode(model="", text="", custom_tokenizer: Optional[dict] = None):

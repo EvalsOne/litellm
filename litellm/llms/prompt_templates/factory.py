@@ -1163,14 +1163,17 @@ def convert_to_anthropic_tool_result(
         str,
         List[Union[AnthropicMessagesToolResultContent, AnthropicMessagesImageParam]],
     ] = ""
+
     if isinstance(message["content"], str):
         anthropic_content = message["content"]
     elif isinstance(message["content"], List):
+        print("anthropic_content is a list")
         content_list = message["content"]
         anthropic_content_list: List[
             Union[AnthropicMessagesToolResultContent, AnthropicMessagesImageParam]
         ] = []
         for content in content_list:
+            print("type of content is:", type(content))
             if content["type"] == "text":
                 anthropic_content_list.append(
                     AnthropicMessagesToolResultContent(
@@ -1195,9 +1198,14 @@ def convert_to_anthropic_tool_result(
                         ),
                     )
                 )
+            # else:
+            #     print("content is not text or image_url")
+            #     anthropic_content_list.append(content)
 
         anthropic_content = anthropic_content_list
+
     anthropic_tool_result: Optional[AnthropicMessagesToolResultParam] = None
+
     ## PROMPT CACHING CHECK ##
     cache_control = message.get("cache_control", None)
     if message["role"] == "tool":
